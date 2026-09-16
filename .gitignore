@@ -1,0 +1,42 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local environment & secrets
+.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs & local runtime data
+logs/
+*.log
+
+# Runtime data dumps (never commit generated CSVs / screen dumps)
+*.csv
+screen*.txt
+hope_logs.txt
+live_pnl_log.csv
+.trading_state.json
+
+# Local secrets kept out of git
+.env
+.env.*
+utils/*.token*
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
