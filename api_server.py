@@ -1064,7 +1064,7 @@ async def fetch_session_from_db(session_id: str) -> Optional[Dict[str, Any]]:
     """Fetch persisted session doc and decrypt credentials/tokens if stored."""
     if not DB_CONNECTED:
         return None
-    doc = sessions_collection.find_one({"session_id": session_id})
+    doc = await run_in_threadpool(_fetch_session_sync, session_id)
     if not doc:
         return None
 
@@ -1638,11 +1638,14 @@ async def get_or_restore_session(session_id: str) -> Optional[Dict[str, Any]]:
                 
                 broker = BrokerConnector(require_totp=False)
                 
-                restored_session = broker.restore_session({
-                    "token": broker_session_db.get("token"),
-                    "refresh_token": broker_session_db.get("refresh_token"),
-                    "feed_token": broker_session_db.get("feed_token"),
-                })
+                restored_session = await run_in_threadpool(
+                    broker.restore_session,
+                    {
+                        "token": broker_session_db.get("token"),
+                        "refresh_token": broker_session_db.get("refresh_token"),
+                        "feed_token": broker_session_db.get("feed_token"),
+                    },
+                )
                 
                 # Cleanup env
                 for key in ["ANGEL_API_KEY", "ANGEL_CLIENT_CODE", "ANGEL_PASSWORD"]:
