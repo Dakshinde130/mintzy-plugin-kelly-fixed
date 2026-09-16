@@ -2,6 +2,7 @@
 import os
 import time
 import json
+import uuid
 import redis
 import threading
 import multiprocessing as mp
@@ -40,9 +41,12 @@ SIMULATION_STOP_PREFIX = "autotrader:simulation_stop:"
 # "stopped", which de-authenticates it and blocks the live start.
 SIMULATION_STOP_TTL = int(os.environ.get("SIMULATION_STOP_TTL", "1800"))
 PYRAMID_RESULT_PREFIX = "autotrader:pyramid_result:"
-PYRAMID_RESULT_TTL = 600
+# TTLs must outlive the whole shutdown (trader join + square-off + pyramid apply).
+# A slow square-off previously expired both keys -> API polled "not_started" after
+# the stop had actually completed, and a profitable handoff could read as {}.
+PYRAMID_RESULT_TTL = int(os.environ.get("PYRAMID_RESULT_TTL", "3600"))
 STOP_JOB_PREFIX = "autotrader:stop_job:"
-STOP_JOB_TTL = 600
+STOP_JOB_TTL = int(os.environ.get("STOP_JOB_TTL", "3600"))
 
 # Grace period for concurrent live-start when worker meta is missing (legacy / race).
 LIVE_START_WORKER_GRACE_SECONDS = int(os.environ.get("LIVE_START_WORKER_GRACE_SECONDS", "60"))
@@ -78,6 +82,60 @@ def _signal_trader_stop(trader, stop_event, session_id: str, reason: str) -> Non
         trader.stop_event.set()
         print(f"[Worker-{session_id}] trader.stop_event set ({reason})")
     stop_event.set()
+
+
+def _persist_session_mongo_status(
+    mongo_db,
+    session_id: str,
+    status: str,
+    *,
+    exit_redis_client=None,
+    retries: int = 3,
+) -> None:
+    """
+    Persist worker-exit status to Mongo with bounded retry, and leave a Redis
+    reconciliation marker on final failure. Previously fire-and-forget: a Mongo
+    outage left the DB showing an alive session while the worker was already dead.
+    """
+    sessions_collection = mongo_db["plugin_sessions"]
+    sets: Dict[str, Any] = {"trading_status": status, "last_updated": datetime.utcnow()}
+    if status == "simulation_stopped":
+        sets["simulation_stopped_at"] = datetime.utcnow()
+    elif status == "stopped":
+        sets["status"] = "stopped"
+        sets["stopped_at"] = datetime.utcnow()
+
+    last_err = None
+    for attempt in range(retries):
+        try:
+            sessions_collection.update_one({"session_id": session_id}, {"$set": sets})
+            print(
+                f"[SessionManager] Worker-{session_id} status={status} persisted in Mongo "
+                f"(attempt {attempt + 1})"
+            )
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+
+    print(
+        f"[Worker-{session_id}] Failed to mark {status} in Mongo after {retries} attempts: "
+        f"{last_err}"
+    )
+    if exit_redis_client:
+        try:
+            exit_redis_client.setex(
+                f"{SESSION_PREFIX}{session_id}:mongo_status",
+                86400,
+                json.dumps({"trading_status": status, "at": time.time()}),
+            )
+            print(
+                f"[Worker-{session_id}] Mongo status write failed -> reconciliation marker "
+                f"stored (trading_status={status})"
+            )
+        except Exception as mse:
+            print(f"[Worker-{session_id}] Failed to write Mongo reconciliation marker: {mse}")
 
 
 class WorkerProcess:
@@ -330,12 +388,21 @@ def _trader_worker(
                     if exit_req_raw:
                         data = json.loads(exit_req_raw)
                         exit_symbol = data.get("symbol", "")
+                        exit_nonce = data.get("nonce") or None
                         print(f"[Worker-{session_id}] Exit request received for symbol: {exit_symbol}")
                         result = trader.exit_single_position(exit_symbol)
-                        # Push result back to Redis for the API to read. TTL matches
-                        # the 300s exit-queue TTL so a slow worker fill isn't lost.
-                        result_key = exit_result_key(session_id, exit_symbol)
+                        # Publish to the attempt-scoped result key so two concurrent
+                        # exits for the same symbol never collide. Also mirror to the
+                        # legacy key for any older API clients. TTL matches the 300s
+                        # exit-queue TTL so a slow worker fill isn't lost.
+                        result_key = exit_result_key(session_id, exit_symbol, exit_nonce)
                         exit_redis_client.setex(result_key, 300, json.dumps(result))
+                        if exit_nonce:
+                            exit_redis_client.setex(
+                                exit_result_key(session_id, exit_symbol),
+                                300,
+                                json.dumps(result),
+                            )
                         print(f"[Worker-{session_id}] Exit result for {exit_symbol}: {result}")
                 except Exception as e:
                     print(f"[Worker-{session_id}] Exit queue check error: {e}")
@@ -374,6 +441,29 @@ def _trader_worker(
                 except Exception as e:
                     print(f"[Worker-{session_id}] Failed to store pyramid handoff in Redis: {e}")
 
+            # Durable copy of the handoff (Mongo) so a Redis loss never turns a
+            # profitable pyramid into {} -> live_allowed=False -> "pyramid_not_run"
+            # on the API side. The API reads this as the last-chance fallback.
+            try:
+                sessions_collection = mongo_db["plugin_sessions"]
+                sessions_collection.update_one(
+                    {"session_id": session_id},
+                    {
+                        "$set": {
+                            "pyramid_handoff": handoff,
+                            "pyramid_handoff_at": datetime.utcnow(),
+                            "last_updated": datetime.utcnow(),
+                        }
+                    },
+                    upsert=True,
+                )
+                print(
+                    f"[Worker-{session_id}] Pyramid handoff durable in Mongo "
+                    f"(live_allowed={handoff.get('live_allowed')}, reason={handoff.get('reason')})"
+                )
+            except Exception as e:
+                print(f"[Worker-{session_id}] Failed to persist pyramid handoff to Mongo: {e}")
+
         if ltp_stream is not None:
             try:
                 ltp_stream.stop()
@@ -405,27 +495,41 @@ def _trader_worker(
         except Exception as e:
             print(f"[Worker-{session_id}] Stop job lookup error: {e}")
 
+        # Fourth signal: durable intent marker the API persisted in Mongo _before_
+        # sending SIGTERM. This is the only classifier that survives a Redis outage
+        # during shutdown (the flag, the stop job, and the latch all live in Redis).
+        # Cleared once consumed so a stale marker can't mislabel a later worker.
+        if not simulation_stop:
+            try:
+                intent_doc = mongo_db["plugin_sessions"].find_one(
+                    {"session_id": session_id},
+                    {"simulation_stop_pending": 1},
+                )
+                intent = (intent_doc or {}).get("simulation_stop_pending")
+                if intent and isinstance(intent, dict):
+                    intent_at = float(intent.get("at") or 0)
+                    if intent_at and (time.time() - intent_at) < SIMULATION_STOP_TTL:
+                        simulation_stop = True
+                        mongo_db["plugin_sessions"].update_one(
+                            {"session_id": session_id},
+                            {"$unset": {"simulation_stop_pending": ""}},
+                        )
+                        print(
+                            f"[Worker-{session_id}] Simulation stop inferred from durable "
+                            "Mongo intent marker (Redis unavailable)"
+                        )
+            except Exception as e:
+                print(f"[Worker-{session_id}] Simulation stop Mongo intent check error: {e}")
+
         if simulation_stop:
             health_queue.put({
                 "session_id": session_id,
                 "status": "simulation_stopped",
                 "timestamp": time.time()
             })
-            try:
-                sessions_collection = mongo_db["plugin_sessions"]
-                sessions_collection.update_one(
-                    {"session_id": session_id},
-                    {
-                        "$set": {
-                            "trading_status": "simulation_stopped",
-                            "simulation_stopped_at": datetime.utcnow(),
-                            "last_updated": datetime.utcnow()
-                        }
-                    }
-                )
-                print(f"[Worker-{session_id}] Simulation stopped in Mongo (session auth unchanged)")
-            except Exception as e:
-                print(f"[Worker-{session_id}] Failed to mark simulation stopped in Mongo: {e}")
+            _persist_session_mongo_status(
+                mongo_db, session_id, "simulation_stopped", exit_redis_client=exit_redis_client
+            )
 
             if stop_event.is_set():
                 try:
@@ -444,23 +548,9 @@ def _trader_worker(
                 "status": "stopped",
                 "timestamp": time.time()
             })
-
-            try:
-                sessions_collection = mongo_db["plugin_sessions"]
-                sessions_collection.update_one(
-                    {"session_id": session_id},
-                    {
-                        "$set": {
-                            "status": "stopped",
-                            "trading_status": "stopped",
-                            "stopped_at": datetime.utcnow(),
-                            "last_updated": datetime.utcnow()
-                        }
-                    }
-                )
-                print(f"[Worker-{session_id}] Session status marked stopped in Mongo")
-            except Exception as e:
-                print(f"[Worker-{session_id}] Failed to mark session stopped in Mongo: {e}")
+            _persist_session_mongo_status(
+                mongo_db, session_id, "stopped", exit_redis_client=exit_redis_client
+            )
         
         # Cleanup
         mongo_client.close()
@@ -625,6 +715,18 @@ class SessionManager:
         except Exception as e:
             print(f"[SessionManager] Failed to read pyramid handoff for {session_id}: {e}")
             return None
+
+    @classmethod
+    def read_pyramid_handoff_snapshot(cls, session_id: str):
+        """
+        Read the handoff from the canonical chain instead of one key:
+        stop_job.pyramid (the completed barrier) first, then the standalone
+        pyramid_result key. Callers layer a durable Mongo fallback on top.
+        """
+        job = cls.read_stop_job(session_id)
+        if job and isinstance(job.get("pyramid"), dict) and job["pyramid"]:
+            return job["pyramid"]
+        return cls.read_pyramid_handoff_result(session_id)
 
     @classmethod
     def clear_pyramid_handoff_result(cls, session_id: str) -> None:
@@ -1581,7 +1683,7 @@ class SessionManager:
                 cls.fail_stop_job(session_id, "Worker did not exit in time")
                 return False
         if stopped:
-            handoff = cls.read_pyramid_handoff_result(session_id) or dict(_PYRAMID_HANDOFF_BLOCKED)
+            handoff = cls.read_pyramid_handoff_snapshot(session_id) or dict(_PYRAMID_HANDOFF_BLOCKED)
             cls.complete_stop_job(session_id, handoff, simulation_stop=True)
         return stopped
     
@@ -1615,7 +1717,8 @@ class SessionManager:
         # Push exit request to Redis queue
         try:
             exit_queue_key = exit_request_key(session_id)
-            payload = json.dumps({"symbol": symbol.upper()})
+            nonce = uuid.uuid4().hex[:8]
+            payload = json.dumps({"symbol": symbol.upper(), "nonce": nonce})
             cls._redis().rpush(exit_queue_key, payload)
             # Set TTL on the queue key so it auto-cleans (5 minutes)
             cls._redis().expire(exit_queue_key, 300)
@@ -1623,7 +1726,7 @@ class SessionManager:
             print(f"[SessionManager] Ã¢Å“â€¦ Exit request pushed to Redis for {symbol}")
             
             # Wait briefly for the result (max 10 seconds)
-            result_key = exit_result_key(session_id, symbol)
+            result_key = exit_result_key(session_id, symbol, nonce)
             for _ in range(20):  # 20 Ãƒâ€” 0.5s = 10s
                 time.sleep(0.5)
                 result_raw = cls._redis().get(result_key)

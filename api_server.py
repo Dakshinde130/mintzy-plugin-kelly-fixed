@@ -1071,7 +1071,8 @@ async def fetch_session_from_db(session_id: str) -> Optional[Dict[str, Any]]:
     restored = {
         "session_id": doc.get("session_id"),
         "status": doc.get("status"),
-        
+        "trading_status": doc.get("trading_status"),
+        "pyramid_handoff": doc.get("pyramid_handoff"),
         "free_cash": doc.get("free_cash"),
         "created_at": doc.get("created_at"),
         "authenticated_at": doc.get("authenticated_at"),
@@ -2854,10 +2855,73 @@ async def _lookup_stop_simulation_session(session_id: str):
         or session_id in trading_logs
     )
     db_record = None
-    if not session_exists and DB_CONNECTED:
+    if DB_CONNECTED:
         db_record = await fetch_session_from_db(session_id)
-        session_exists = db_record is not None
+        session_exists = session_exists or (db_record is not None)
     return session_exists, db_record
+
+
+def _persist_simulation_stop_intent(session_id: str) -> None:
+    """
+    Best-effort durable intent record written to Mongo BEFORE the worker is
+    signaled. The worker consults it as its last-chance classifier when Redis is
+    down during shutdown (the Redis flag, stop job, and latch all live in Redis).
+    """
+    if not DB_CONNECTED:
+        return
+    try:
+        sessions_collection.update_one(
+            {"session_id": session_id},
+            {
+                "$set": {
+                    "simulation_stop_pending": {
+                        "at": time.time(),
+                        "reason": "simulation_stop",
+                    },
+                    "last_updated": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        print(f"[SIM-STOP-INTENT] Failed to persist intent marker for {session_id}: {exc}")
+
+
+def _clear_simulation_stop_intent(session_id: str) -> None:
+    if not DB_CONNECTED:
+        return
+    try:
+        sessions_collection.update_one(
+            {"session_id": session_id},
+            {"$unset": {"simulation_stop_pending": ""}},
+        )
+    except Exception as exc:
+        print(f"[SIM-STOP-INTENT] Failed to clear intent marker for {session_id}: {exc}")
+
+
+def _resolve_pyramid_handoff(session_id: str, db_record) -> Dict[str, Any]:
+    """
+    Single read chain for the pyramid handoff: completed stop job -> standalone
+    pyramid_result key -> durable Mongo copy written by the worker. An empty dict
+    is returned (safe default) so callers keep today's blocking behavior instead
+    of inventing a handoff.
+    """
+    handoff = SessionManager.read_pyramid_handoff_snapshot(session_id)
+    if not handoff:
+        candidate = None
+        try:
+            if db_record:
+                candidate = (db_record or {}).get("pyramid_handoff")
+            if not candidate and DB_CONNECTED:
+                doc = sessions_collection.find_one(
+                    {"session_id": session_id}, {"pyramid_handoff": 1, "_id": 0}
+                )
+                candidate = (doc or {}).get("pyramid_handoff")
+            if isinstance(candidate, dict) and candidate:
+                handoff = candidate
+        except Exception as exc:
+            print(f"[PYRAMID] Mongo handoff fallback read failed for {session_id}: {exc}")
+    return handoff or {}
 
 
 async def _finalize_stop_simulation_response(
@@ -2922,6 +2986,7 @@ async def _finalize_stop_simulation_response(
             )
 
         SessionManager.clear_pyramid_handoff_result(session_id)
+        _clear_simulation_stop_intent(session_id)
         add_log(
             session_id,
             "Paper simulation stopped — no profitable symbols; session marked stopped",
@@ -2972,6 +3037,7 @@ async def _finalize_stop_simulation_response(
         )
 
     SessionManager.clear_pyramid_handoff_result(session_id)
+    _clear_simulation_stop_intent(session_id)
     add_log(session_id, "Paper simulation stopped (session remains authenticated)")
 
     response_payload = {
@@ -3039,6 +3105,10 @@ async def stop_trading_simulation(
 
     stop_worker_started_perf = time.perf_counter()
 
+    # Durable intent: persisted before the worker is ever signaled so it can still
+    # classify this as a simulation stop if Redis goes down mid-shutdown.
+    _persist_simulation_stop_intent(session_id)
+
     if wait:
         stopped = await run_in_threadpool(SessionManager.stop_simulation_session, session_id)
         _sim_plugin_log(
@@ -3048,11 +3118,12 @@ async def stop_trading_simulation(
             elapsed_ms=_sim_plugin_elapsed_ms(stop_worker_started_perf),
         )
         if not stopped:
+            _clear_simulation_stop_intent(session_id)
             raise HTTPException(
                 status_code=503,
                 detail="Failed to stop paper simulation (simulation-stop flag or worker shutdown failed)",
             )
-        pyramid_handoff = SessionManager.read_pyramid_handoff_result(session_id) or {}
+        pyramid_handoff = _resolve_pyramid_handoff(session_id, db_record)
         response_payload = await _finalize_stop_simulation_response(
             session_id,
             pyramid_handoff,
@@ -3076,6 +3147,7 @@ async def stop_trading_simulation(
     )
 
     if not stopped:
+        _clear_simulation_stop_intent(session_id)
         _sim_plugin_log(
             "stop-simulation ABORT async worker signal failed",
             session_id=session_id,
@@ -3112,9 +3184,33 @@ async def get_stop_simulation_status(session_id: str, x_plugin_api_key: str = He
     """
     job = SessionManager.read_stop_job(session_id)
     if not job:
-        session_exists, _ = await _lookup_stop_simulation_session(session_id)
+        session_exists, db_record = await _lookup_stop_simulation_session(session_id)
         if not session_exists:
             raise HTTPException(status_code=404, detail="Session not found")
+        db_status = (db_record or {}).get("trading_status") or (db_record or {}).get("status")
+        mongo_handoff = (db_record or {}).get("pyramid_handoff")
+        if mongo_handoff or db_status in ("simulation_stopped", "stopped"):
+            # Stop job expired (slow square-off) but the stop already completed
+            # durably — finalize from the Mongo record instead of reporting
+            # "not_started" for a stop that actually finished.
+            _sim_plugin_log(
+                "stop-simulation status: job expired, finalizing from durable Mongo record",
+                session_id=session_id,
+                db_status=db_status,
+                mongo_handoff=bool(mongo_handoff),
+            )
+            response_payload = await _finalize_stop_simulation_response(
+                session_id,
+                _resolve_pyramid_handoff(session_id, db_record),
+                db_record,
+            )
+            SessionManager.update_stop_job(
+                session_id,
+                status="completed",
+                finalized=True,
+                response=response_payload,
+            )
+            return response_payload
         return {
             "success": True,
             "ready": False,
@@ -3152,11 +3248,7 @@ async def get_stop_simulation_status(session_id: str, x_plugin_api_key: str = He
             return cached
 
         _, db_record = await _lookup_stop_simulation_session(session_id)
-        pyramid_handoff = (
-            job.get("pyramid")
-            or SessionManager.read_pyramid_handoff_result(session_id)
-            or {}
-        )
+        pyramid_handoff = _resolve_pyramid_handoff(session_id, db_record)
         response_payload = await _finalize_stop_simulation_response(
             session_id,
             pyramid_handoff,

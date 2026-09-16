@@ -55,8 +55,12 @@ def exit_request_key(session_id: str) -> str:
     return f"{EXIT_REQUEST_PREFIX}{session_id}"
 
 
-def exit_result_key(session_id: str, symbol: str) -> str:
+def exit_result_key(session_id: str, symbol: str, nonce: str = None) -> str:
     sym = (symbol or "").upper().replace("-EQ", "").strip()
+    if nonce:
+        # Nonce-scoped result key: two concurrent exits for the same symbol each
+        # publish to their own key instead of colliding on the shared one.
+        return f"{EXIT_RESULT_PREFIX}{session_id}:{sym}:{nonce}"
     return f"{EXIT_RESULT_PREFIX}{session_id}:{sym}"
 
 
