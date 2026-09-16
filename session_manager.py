@@ -332,9 +332,10 @@ def _trader_worker(
                         exit_symbol = data.get("symbol", "")
                         print(f"[Worker-{session_id}] Exit request received for symbol: {exit_symbol}")
                         result = trader.exit_single_position(exit_symbol)
-                        # Push result back to Redis for the API to read
+                        # Push result back to Redis for the API to read. TTL matches
+                        # the 300s exit-queue TTL so a slow worker fill isn't lost.
                         result_key = exit_result_key(session_id, exit_symbol)
-                        exit_redis_client.setex(result_key, 60, json.dumps(result))
+                        exit_redis_client.setex(result_key, 300, json.dumps(result))
                         print(f"[Worker-{session_id}] Exit result for {exit_symbol}: {result}")
                 except Exception as e:
                     print(f"[Worker-{session_id}] Exit queue check error: {e}")
@@ -986,7 +987,27 @@ class SessionManager:
                 )
                 return LiveStartPrepResult.LIVE_ALREADY_RUNNING
 
-            strategy = (meta or {}).get("strategy")
+            # Redis pid alive but its meta key was evicted. We can no longer tell
+            # paper from live, and `_session_has_live_worker` above only knows the
+            # local registry — a live worker started by a different gunicorn worker
+            # is invisible here, so killing blindly would orphan a live session.
+            if meta is None:
+                provably_our_paper = bool(
+                    local_worker
+                    and local_worker.is_alive()
+                    and local_worker.strategy == "B"
+                    and local_worker.process.pid == redis_pid
+                )
+                if not provably_our_paper:
+                    print(
+                        f"[SessionManager] prepare_for_live_start: NOT_CLEARED session={session_id} "
+                        f"pid={redis_pid} redis_meta_missing=True — refusing to kill an "
+                        "undocumented worker (may be a live worker whose meta key was evicted). "
+                        "Stop the session explicitly before starting live."
+                    )
+                    return LiveStartPrepResult.NOT_CLEARED
+
+            strategy = (meta or {}).get("strategy") or (local_worker.strategy if local_worker else None)
             print(
                 f"[SessionManager] prepare_for_live_start: force-killing paper/stale worker "
                 f"session={session_id} pid={redis_pid} strategy={strategy or 'unknown'}"
@@ -1008,6 +1029,57 @@ class SessionManager:
             if cls._terminate_session_worker(session_id, timeout):
                 return LiveStartPrepResult.PAPER_CLEARED
             return LiveStartPrepResult.NOT_CLEARED
+
+        # pid key evicted but the meta key survived with the spawned pid — use the
+        # meta pid as a second source of truth instead of a blind CLEAR.
+        meta_pid = (meta or {}).get("pid") if meta else None
+        if meta is not None and meta_pid and cls._pid_alive(meta_pid):
+            if cls._is_live_worker_meta(meta):
+                print(
+                    f"[SessionManager] prepare_for_live_start: LIVE_ALREADY_RUNNING "
+                    f"session={session_id} pid={meta_pid} (from meta; pid key evicted)"
+                )
+                try:
+                    cls._redis().setex(
+                        session_pid_key(session_id), cls.SESSION_REDIS_TTL, str(meta_pid)
+                    )
+                except Exception as e:
+                    print(f"[SessionManager] prepare_for_live_start: meta pid republish failed: {e}")
+                return LiveStartPrepResult.LIVE_ALREADY_RUNNING
+            # meta-known paper worker still alive — clear it explicitly by pid.
+            print(
+                f"[SessionManager] prepare_for_live_start: clearing meta-referenced paper worker "
+                f"session={session_id} pid={meta_pid}"
+            )
+            try:
+                os.kill(meta_pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError) as e:
+                print(f"[SessionManager] prepare_for_live_start: meta-paper kill failed: {e}")
+            cls._wait_for_pid_exit(meta_pid, timeout=min(timeout, 20.0))
+            cls._delete_session_redis_keys(session_id)
+            return LiveStartPrepResult.PAPER_CLEARED
+
+        # Nothing is running on a settled pid, but Redis only holds a start
+        # reservation (pid: None). A concurrent start in another gunicorn worker is
+        # in flight (or its post-start Redis save failed) — never treat that as CLEAR.
+        if meta is not None and meta.get("reserved") and not meta.get("pid"):
+            started_at = meta.get("started_at")
+            fresh = False
+            if started_at:
+                try:
+                    fresh = (time.time() - float(started_at)) < LIVE_START_WORKER_GRACE_SECONDS
+                except (TypeError, ValueError):
+                    pass
+            if fresh:
+                print(
+                    f"[SessionManager] prepare_for_live_start: NOT_CLEARED session={session_id} "
+                    "in-flight reservation (pid=None) — refusing concurrent start"
+                )
+                return LiveStartPrepResult.NOT_CLEARED
+            print(
+                f"[SessionManager] prepare_for_live_start: stale reservation for "
+                f"session={session_id} — treating as clear"
+            )
 
         print(f"[SessionManager] prepare_for_live_start: CLEAR session={session_id}")
         return LiveStartPrepResult.CLEAR
@@ -1266,13 +1338,19 @@ class SessionManager:
         if not meta_saved:
             e = last_redis_err or RuntimeError("Redis save failed")
             print(f"[SessionManager] CRITICAL: Redis save failed: {e}")
-            strict_meta = os.environ.get("EOD_STRICT_REDIS_META", "false").lower() in (
+            # A live worker whose pid/meta never reached Redis is invisible to other
+            # gunicorn workers (double-start race) and loses EOD square-off / stop
+            # coordination. That makes the session unsafely runnable, so fail hard
+            # for live unconditionally. EOD_STRICT_REDIS_META now only governs the
+            # paper (B) path, keeping a rollback for sim sessions.
+            strict_meta = os.environ.get("EOD_STRICT_REDIS_META", "true").lower() in (
                 "1", "true", "yes",
             )
-            if strict_meta and strategy != "B":
+            if strategy != "B" or strict_meta:
                 print(
-                    f"[SessionManager] EOD_STRICT_REDIS_META — terminating worker "
-                    f"session={session_id} pid={process.pid}"
+                    f"[SessionManager] Redis meta save failed — terminating worker "
+                    f"session={session_id} pid={process.pid} "
+                    f"strategy={strategy} strict_meta={strict_meta}"
                 )
                 try:
                     if process.is_alive():

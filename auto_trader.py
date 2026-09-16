@@ -1119,6 +1119,113 @@ class AutoTrader:
             release_eod_exit_in_progress(self)
             return False
 
+    def exit_single_position(self, symbol: str, exit_reason: str = "MANUAL_EXIT") -> dict:
+        """Exit a single symbol's position (manual / RMS single-symbol exit).
+
+        Mirrors the exposure-expansion traders: refresh broker positions, place a
+        MARKET exit order for the held qty, and hand it to _reconcile_pending_orders
+        so the fill/price is tracked exactly like engine exits. Returns a
+        JSON-serializable result dict for the cross-process Redis result key.
+        """
+        symbol = str(symbol or "").upper().replace("-EQ", "").strip()
+        if not symbol:
+            return {"success": False, "symbol": symbol, "message": "Empty symbol"}
+        print(f"\n[SINGLE EXIT] Request to exit position: {symbol}")
+
+        try:
+            # 1) Refresh broker positions
+            with self.broker_pos_lock:
+                self._broker_positions_cache = self._get_broker_positions()
+                broker_positions = list(self._broker_positions_cache or [])
+
+            # 2) Find the target symbol
+            target_pos = None
+            for pos in broker_positions:
+                if pos.get("symbol") == symbol:
+                    target_pos = pos
+                    break
+
+            if not target_pos:
+                msg = f"No open position found for {symbol}"
+                print(f"[SINGLE EXIT] {msg}")
+                return {"success": False, "symbol": symbol, "message": msg}
+
+            side = target_pos.get("side")
+            qty = int(target_pos.get("qty", 0) or 0)
+            if qty <= 0:
+                msg = f"No open qty for {symbol}"
+                print(f"[SINGLE EXIT] {msg}")
+                return {"success": False, "symbol": symbol, "message": msg}
+
+            curr_price = float(target_pos.get("ltp", 0.0) or 0.0)
+            exit_side = "SELL" if side == "BUY" else "BUY"
+            action_type = "EXIT_LONG" if side == "BUY" else "COVER_SHORT"
+
+            print(f"[SINGLE EXIT] {symbol}: Closing {side} position (qty={qty}) @ {curr_price:.2f}")
+
+            # 3) Place exit order
+            exit_order = OrderRequest(
+                symbol=symbol,
+                side=exit_side,
+                qty=qty,
+                metadata={
+                    "signal": "SINGLE_EXIT",
+                    "action_type": action_type,
+                    "curr_price": curr_price,
+                    "side": exit_side,
+                    "qty": qty,
+                    "order_value": curr_price * qty,
+                    "original_side": side,
+                    "position_side": side,
+                    "exit_reason": exit_reason,
+                },
+            )
+
+            self._ensure_parallel_executor()
+            results = self.parallel_executor.submit_orders([exit_order])
+
+            if not results:
+                msg = f"No result from order executor for {symbol}"
+                print(f"[SINGLE EXIT] {msg}")
+                return {"success": False, "symbol": symbol, "message": msg}
+
+            result = results[0]
+            metadata = result.metadata or {}
+
+            if result.success:
+                if result.filled and float(result.avg_price or 0.0) > 0:
+                    msg = f"Exit order filled for {symbol} (closed {side} position, qty={qty})"
+                    print(f"[SINGLE EXIT] {msg}")
+                    return {"success": True, "symbol": symbol, "message": msg, "order_id": result.order_id}
+
+                # Not filled yet — hand to reconciliation so the fill/price is
+                # tracked exactly like engine exits (EXIT_LONG / COVER_SHORT).
+                with self.pending_lock:
+                    self.pending_orders[symbol].append({
+                        "order_id": result.order_id,
+                        "action_type": action_type,
+                        "side": exit_side,
+                        "qty": qty,
+                        "order_value": metadata.get("order_value", curr_price * qty),
+                        "position_side": side,
+                        "exit_reason": exit_reason,
+                        "placed_at": time.time(),
+                    })
+                record_engine_order_for_trader(self, result.order_id)
+
+                msg = f"Exit order sent for {symbol} (closing {side} position, qty={qty})"
+                print(f"[SINGLE EXIT] {msg}")
+                return {"success": True, "symbol": symbol, "message": msg, "order_id": result.order_id}
+
+            msg = f"Exit order failed for {symbol}: {result.error}"
+            print(f"[SINGLE EXIT] FAILED: {msg}")
+            return {"success": False, "symbol": symbol, "message": msg}
+
+        except Exception as e:
+            msg = f"Exception during single exit for {symbol}: {e}"
+            print(f"[SINGLE EXIT] FAILED: {msg}")
+            return {"success": False, "symbol": symbol, "message": msg}
+
     def _run_eod_exit_body(self):
         print("\n" + "=" * 80)
         print("  MARKET CLOSE APPROACHING - EXITING SESSION POSITIONS")
