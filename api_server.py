@@ -1790,7 +1790,7 @@ async def authenticate_totp(totp_req: TOTPRequest , x_plugin_api_key: str = Head
         
         # Step 3: Get session from broker
         logger.info(f"[{session_id}] Calling broker.get_session()...")
-        broker_session = broker.get_session()
+        broker_session = await run_in_threadpool(broker.get_session)
         print("broker session in authenticate totp " , broker_session)
         logger.info(f"[{session_id}] broker_session received: {type(broker_session)}")
         logger.info(f"[{session_id}] broker_session keys: {list(broker_session.keys()) if isinstance(broker_session, dict) else 'Not a dict'}")
@@ -1805,7 +1805,7 @@ async def authenticate_totp(totp_req: TOTPRequest , x_plugin_api_key: str = Head
         
         # Step 4: Get account balance
         logger.info(f"[{session_id}] Calling broker.get_account_balance()...")
-        balance_resp = broker.get_account_balance(broker_session)
+        balance_resp = await run_in_threadpool(broker.get_account_balance, broker_session)
         logger.info(f"[{session_id}] balance_resp received: {type(balance_resp)}")
         logger.info(f"[{session_id}] balance_resp: {balance_resp}")
         print("broker object is ",broker)
