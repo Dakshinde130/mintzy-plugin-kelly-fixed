@@ -2044,7 +2044,7 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
     if config.leverage_multiplier is not None:
         early_persist["leverage_multiplier"] = float(config.leverage_multiplier)
     persist_started_perf = time.perf_counter()
-    persist_session_metadata_sync(session_id, early_persist)
+    await persist_session_metadata(session_id, early_persist)
     if is_simulation_start:
         _sim_plugin_log(
             "start_trading phase=persist_session_metadata_sync (early)",
@@ -2106,7 +2106,7 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
 
         # Candle handling (unchanged)
         if getattr(config, "candle", None):
-            persist_session_metadata_sync(session_id, {"candle_interval": str(config.candle)})
+            await persist_session_metadata(session_id, {"candle_interval": str(config.candle)})
             sessions_store[session_id]["candle_interval"] = str(config.candle)
 
         session_candle = session_data.get("candle_interval")
@@ -2300,7 +2300,7 @@ async def start_trading(config: TradingConfig ,x_plugin_api_key: str = Header(No
         if config.leverage_multiplier is not None:
             persist_payload["leverage_multiplier"] = float(config.leverage_multiplier)
         persist_started_perf = time.perf_counter()
-        persist_session_metadata_sync(session_id, persist_payload)
+        await persist_session_metadata(session_id, persist_payload)
         if is_simulation_start:
             _sim_plugin_log(
                 "start_trading phase=persist_session_metadata_sync (final)",
@@ -2907,7 +2907,7 @@ async def _finalize_stop_simulation_response(
             }
             if post_restore_configuration_id:
                 persist_payload["configuration_id"] = post_restore_configuration_id
-            persist_session_metadata_sync(session_id, persist_payload)
+            await persist_session_metadata(session_id, persist_payload)
         except Exception as persist_err:
             _sim_plugin_log(
                 "stop-simulation persist warning",
@@ -2957,7 +2957,7 @@ async def _finalize_stop_simulation_response(
         }
         if post_restore_configuration_id:
             persist_payload["configuration_id"] = post_restore_configuration_id
-        persist_session_metadata_sync(session_id, persist_payload)
+        await persist_session_metadata(session_id, persist_payload)
     except Exception as persist_err:
         _sim_plugin_log(
             "stop-simulation persist warning",
