@@ -779,6 +779,64 @@ class BrokerConnector:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
+    def get_bulk_ltp(self, session, instruments):
+        """Get LTP for multiple instruments at once.
+
+        Parameters
+        ----------
+        session : dict
+            Active broker session (must contain 'obj').
+        instruments : list[str]
+            Instrument strings in ``"EXCHANGE|SYMBOL-EQ"`` format,
+            e.g. ``["NSE|RELIANCE-EQ", "NSE|ITC-EQ"]``.
+
+        Returns
+        -------
+        dict
+            ``{"status": "success", "data": [{"symbol": ..., "ltp": ...}, ...]}``
+            on success; ``{"status": "error", ...}`` on failure.
+
+        The caller in ``auto_trader._get_ltps`` expects ``resp["data"]`` or
+        ``resp.get("raw", {}).get("data")`` to be a list of dicts with an
+        ``ltp`` key.
+        """
+        if not session or "obj" not in session:
+            return {"status": "error", "error": "No active session object provided."}
+
+        results = []
+        for inst in instruments or []:
+            try:
+                parts = str(inst).split("|", 1)
+                exchange = parts[0] if len(parts) == 2 else "NSE"
+                trading_symbol = parts[1] if len(parts) == 2 else parts[0]
+
+                symbol_token = self.get_symbol_token(trading_symbol)
+                if not symbol_token:
+                    print(f"[get_bulk_ltp] No token found for {trading_symbol}")
+                    continue
+
+                resp = self._call_api(
+                    session["obj"].ltpData, exchange, trading_symbol, symbol_token
+                )
+
+                # SmartAPI ltpData returns: {"data": {"exchange": ..., "ltp": ..., ...}}
+                ltp_data = None
+                if isinstance(resp, dict):
+                    ltp_data = resp.get("data")
+                if isinstance(ltp_data, dict):
+                    ltp_val = ltp_data.get("ltp")
+                    if ltp_val is not None:
+                        results.append({
+                            "symbol": trading_symbol,
+                            "ltp": float(ltp_val),
+                        })
+            except Exception as e:
+                print(f"[get_bulk_ltp] Error fetching LTP for {inst}: {e}")
+                continue
+
+        return {"status": "success", "data": results}
+
+
     def get_positions(self, session):
         """Get positions."""
         if not session or "obj" not in session:

@@ -769,13 +769,13 @@ class AutoTrader:
             if exit_price <= 0:
                 exit_price = getattr(self, "_cycle_ltp_cache", {}).get(symbol, 0.0)
                 if exit_price > 0:
-                    print(f"[WARN] {symbol}: exit price broker se nahi mili, LTP use kar rahe hain: â‚¹{exit_price:.2f}")
+                    print(f"[WARN] {symbol}: exit price broker se nahi mili, LTP use kar rahe hain: \u20b9{exit_price:.2f}")
 
-            # âœ… Step 3: P&L calculate karo (self.positions abhi bhi exist karti hai)
+            # ✅ Step 3: P&L calculate karo (self.positions abhi bhi exist karti hai)
             if exit_price > 0 and symbol in self.positions:
                 pnl = self._close_position(self.session, symbol, exit_price)
                 # _close_position andar se self.positions.pop() bhi karta hai
-                print(f"[P&L REALIZED] {symbol} | Action: {action_type} | Realized: â‚¹{pnl:.2f}")
+                print(f"[P&L REALIZED] {symbol} | Action: {action_type} | Realized: ₹{pnl:.2f}")
                 self._log_trade(
                     symbol,
                     action_type,
@@ -787,11 +787,10 @@ class AutoTrader:
                 )
                 self._track_engine_fill(symbol, broker_pos, ctx)
             else:
-                # Exit price nahi mili ya position nahi thi â€” bas hatao
-                print(f"[WARN] {symbol}: exit price nahi mili ya position exist nahi karti â€” sirf pop kar rahe hain")
+                # Exit price nahi mili ya position nahi thi — bas hatao
+                print(f"[WARN] {symbol}: exit price nahi mili ya position exist nahi karti — sirf pop kar rahe hain")
                 self.positions.pop(symbol, None)
-
-            self._track_engine_fill(symbol, broker_pos, ctx)
+                self._track_engine_fill(symbol, broker_pos, ctx)
             return
 
         # ================================================================

@@ -2861,12 +2861,8 @@ async def _lookup_stop_simulation_session(session_id: str):
     return session_exists, db_record
 
 
-def _persist_simulation_stop_intent(session_id: str) -> None:
-    """
-    Best-effort durable intent record written to Mongo BEFORE the worker is
-    signaled. The worker consults it as its last-chance classifier when Redis is
-    down during shutdown (the Redis flag, stop job, and latch all live in Redis).
-    """
+def _persist_simulation_stop_intent_sync(session_id: str) -> None:
+    """Sync helper — runs the Mongo update_one for the sim-stop intent marker."""
     if not DB_CONNECTED:
         return
     try:
@@ -2887,7 +2883,17 @@ def _persist_simulation_stop_intent(session_id: str) -> None:
         print(f"[SIM-STOP-INTENT] Failed to persist intent marker for {session_id}: {exc}")
 
 
-def _clear_simulation_stop_intent(session_id: str) -> None:
+async def _persist_simulation_stop_intent(session_id: str) -> None:
+    """
+    Best-effort durable intent record written to Mongo BEFORE the worker is
+    signaled. The worker consults it as its last-chance classifier when Redis is
+    down during shutdown (the Redis flag, stop job, and latch all live in Redis).
+    """
+    await run_in_threadpool(_persist_simulation_stop_intent_sync, session_id)
+
+
+def _clear_simulation_stop_intent_sync(session_id: str) -> None:
+    """Sync helper — runs the Mongo update_one to clear the intent marker."""
     if not DB_CONNECTED:
         return
     try:
@@ -2899,13 +2905,12 @@ def _clear_simulation_stop_intent(session_id: str) -> None:
         print(f"[SIM-STOP-INTENT] Failed to clear intent marker for {session_id}: {exc}")
 
 
-def _resolve_pyramid_handoff(session_id: str, db_record) -> Dict[str, Any]:
-    """
-    Single read chain for the pyramid handoff: completed stop job -> standalone
-    pyramid_result key -> durable Mongo copy written by the worker. An empty dict
-    is returned (safe default) so callers keep today's blocking behavior instead
-    of inventing a handoff.
-    """
+async def _clear_simulation_stop_intent(session_id: str) -> None:
+    await run_in_threadpool(_clear_simulation_stop_intent_sync, session_id)
+
+
+def _resolve_pyramid_handoff_sync(session_id: str, db_record) -> Dict[str, Any]:
+    """Sync helper — reads the pyramid handoff from Redis then Mongo fallback."""
     handoff = SessionManager.read_pyramid_handoff_snapshot(session_id)
     if not handoff:
         candidate = None
@@ -2922,6 +2927,16 @@ def _resolve_pyramid_handoff(session_id: str, db_record) -> Dict[str, Any]:
         except Exception as exc:
             print(f"[PYRAMID] Mongo handoff fallback read failed for {session_id}: {exc}")
     return handoff or {}
+
+
+async def _resolve_pyramid_handoff(session_id: str, db_record) -> Dict[str, Any]:
+    """
+    Single read chain for the pyramid handoff: completed stop job -> standalone
+    pyramid_result key -> durable Mongo copy written by the worker. An empty dict
+    is returned (safe default) so callers keep today's blocking behavior instead
+    of inventing a handoff.
+    """
+    return await run_in_threadpool(_resolve_pyramid_handoff_sync, session_id, db_record)
 
 
 async def _finalize_stop_simulation_response(
@@ -2986,7 +3001,7 @@ async def _finalize_stop_simulation_response(
             )
 
         SessionManager.clear_pyramid_handoff_result(session_id)
-        _clear_simulation_stop_intent(session_id)
+        await _clear_simulation_stop_intent(session_id)
         add_log(
             session_id,
             "Paper simulation stopped — no profitable symbols; session marked stopped",
@@ -3037,7 +3052,7 @@ async def _finalize_stop_simulation_response(
         )
 
     SessionManager.clear_pyramid_handoff_result(session_id)
-    _clear_simulation_stop_intent(session_id)
+    await _clear_simulation_stop_intent(session_id)
     add_log(session_id, "Paper simulation stopped (session remains authenticated)")
 
     response_payload = {
@@ -3107,7 +3122,7 @@ async def stop_trading_simulation(
 
     # Durable intent: persisted before the worker is ever signaled so it can still
     # classify this as a simulation stop if Redis goes down mid-shutdown.
-    _persist_simulation_stop_intent(session_id)
+    await _persist_simulation_stop_intent(session_id)
 
     if wait:
         stopped = await run_in_threadpool(SessionManager.stop_simulation_session, session_id)
@@ -3118,12 +3133,12 @@ async def stop_trading_simulation(
             elapsed_ms=_sim_plugin_elapsed_ms(stop_worker_started_perf),
         )
         if not stopped:
-            _clear_simulation_stop_intent(session_id)
+            await _clear_simulation_stop_intent(session_id)
             raise HTTPException(
                 status_code=503,
                 detail="Failed to stop paper simulation (simulation-stop flag or worker shutdown failed)",
             )
-        pyramid_handoff = _resolve_pyramid_handoff(session_id, db_record)
+        pyramid_handoff = await _resolve_pyramid_handoff(session_id, db_record)
         response_payload = await _finalize_stop_simulation_response(
             session_id,
             pyramid_handoff,
@@ -3147,7 +3162,7 @@ async def stop_trading_simulation(
     )
 
     if not stopped:
-        _clear_simulation_stop_intent(session_id)
+        await _clear_simulation_stop_intent(session_id)
         _sim_plugin_log(
             "stop-simulation ABORT async worker signal failed",
             session_id=session_id,
@@ -3201,7 +3216,7 @@ async def get_stop_simulation_status(session_id: str, x_plugin_api_key: str = He
             )
             response_payload = await _finalize_stop_simulation_response(
                 session_id,
-                _resolve_pyramid_handoff(session_id, db_record),
+                await _resolve_pyramid_handoff(session_id, db_record),
                 db_record,
             )
             SessionManager.update_stop_job(
@@ -3248,7 +3263,7 @@ async def get_stop_simulation_status(session_id: str, x_plugin_api_key: str = He
             return cached
 
         _, db_record = await _lookup_stop_simulation_session(session_id)
-        pyramid_handoff = _resolve_pyramid_handoff(session_id, db_record)
+        pyramid_handoff = await _resolve_pyramid_handoff(session_id, db_record)
         response_payload = await _finalize_stop_simulation_response(
             session_id,
             pyramid_handoff,
