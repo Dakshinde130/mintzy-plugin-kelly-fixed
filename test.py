@@ -1,6 +1,7 @@
 
 import sys
-from client import Client
+import os
+from client import PredictionClient
 from auto_trader import AutoTrader
 from alerts import AlertManager
 
@@ -95,7 +96,8 @@ def main():
     print("ðŸ“Œ Ensure your API credentials are set in environment variables or be ready to enter them.\n")
 
     # Initialize components
-    client = Client(api_key="XeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9")
+    prediction_base_url = os.environ.get("PREDICTION_BASE_URL", "http://54.204.215.28:8000/predict")
+    client = PredictionClient(api_key="XeyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", base_url=prediction_base_url)
     alerts = AlertManager()
     trader = AutoTrader(client=client, alerts=alerts)
 
